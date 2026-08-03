@@ -1,11 +1,13 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
+import type { User } from "@supabase/supabase-js";
+import { hasSupabaseConfig, supabase } from "@/app/lib/supabase";
 
 type View = "today" | "plan" | "progress" | "profile";
 type Workout = { id: number; name: string; focus: string; duration: number; calories: number; completed: boolean; day: string };
 type Profile = { name: string; email: string; goal: string; dailySteps: number; dailyWater: number; weeklyWorkouts: number };
-type Store = { profile: Profile; water: number; steps: number; workouts: Workout[]; startedWorkout?: number; loggedIn: boolean };
+type Store = { profile: Profile; water: number; steps: number; workouts: Workout[]; startedWorkout?: number };
 
 const starterWorkouts: Workout[] = [
   { id: 1, name: "Foundation strength", focus: "Full body · beginner friendly", duration: 35, calories: 260, completed: false, day: "Mon" },
@@ -14,7 +16,6 @@ const starterWorkouts: Workout[] = [
 ];
 
 const defaultStore: Store = {
-  loggedIn: false,
   profile: { name: "", email: "", goal: "Feel stronger and move consistently", dailySteps: 8000, dailyWater: 8, weeklyWorkouts: 3 },
   water: 0, steps: 0, workouts: starterWorkouts,
 };
@@ -36,28 +37,43 @@ function Icon({ name, size = 20 }: { name: string; size?: number }) {
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
 }
 
+function BrandMark() {
+  return <span className="brand-mark" aria-hidden="true"><svg viewBox="0 0 40 40" fill="none"><path d="M7 23.5c4.3-8.7 8.7-11.2 13.2-7.3 4.5 3.8 7.3 2.8 12.8-6.7" stroke="currentColor" strokeWidth="4" strokeLinecap="round"/><circle cx="8" cy="24" r="3" fill="currentColor"/><circle cx="33" cy="9" r="3" fill="currentColor"/></svg><span className="brand-word">BeMotion</span></span>;
+}
+
 const percent = (value: number, total: number) => Math.min(100, Math.round((value / total) * 100));
 const initials = (name: string) => name.split(" ").map((part) => part[0]).join("").slice(0, 2).toUpperCase() || "BM";
 
 export default function BeMotionApp() {
   const [store, setStore] = useState<Store>(defaultStore);
-  const [ready, setReady] = useState(false);
+  const [ready, setReady] = useState(!hasSupabaseConfig);
   const [view, setView] = useState<View>("today");
   const [authMode, setAuthMode] = useState<"login" | "signup">("signup");
   const [authError, setAuthError] = useState("");
+  const [authMessage, setAuthMessage] = useState("");
+  const [authPending, setAuthPending] = useState(false);
+  const [user, setUser] = useState<User | null>(null);
   const [notice, setNotice] = useState("");
 
   useEffect(() => {
-    const saved = localStorage.getItem("bemotion-data");
-    const timer = window.setTimeout(() => {
-      if (saved) {
-        try { setStore(JSON.parse(saved)); } catch { localStorage.removeItem("bemotion-data"); }
-      }
-      setReady(true);
-    }, 0);
-    return () => window.clearTimeout(timer);
+    if (!supabase) return;
+    let active = true;
+    supabase.auth.getUser().then(({ data }) => { if (active) { setUser(data.user); setReady(true); } });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => { setUser(session?.user ?? null); setReady(true); });
+    return () => { active = false; subscription.unsubscribe(); };
   }, []);
-  useEffect(() => { if (ready) localStorage.setItem("bemotion-data", JSON.stringify(store)); }, [store, ready]);
+  useEffect(() => {
+    if (!ready || !user) return;
+    const saved = localStorage.getItem(`bemotion-data:${user.id}`);
+    window.setTimeout(() => {
+      if (saved) {
+        try { setStore(JSON.parse(saved)); } catch { localStorage.removeItem(`bemotion-data:${user.id}`); }
+      } else {
+        setStore({ ...defaultStore, profile: { ...defaultStore.profile, name: String(user.user_metadata.full_name || user.email?.split("@")[0] || "Mover"), email: user.email || "" } });
+      }
+    }, 0);
+  }, [ready, user]);
+  useEffect(() => { if (ready && user) localStorage.setItem(`bemotion-data:${user.id}`, JSON.stringify(store)); }, [store, ready, user]);
 
   const update = (fn: (current: Store) => Store) => setStore((current) => fn(current));
   const completed = store.workouts.filter((w) => w.completed).length;
@@ -65,27 +81,36 @@ export default function BeMotionApp() {
   const score = Math.round((percent(store.steps, store.profile.dailySteps) + percent(store.water, store.profile.dailyWater) + percent(completed, store.profile.weeklyWorkouts)) / 3);
   const greeting = new Intl.DateTimeFormat("en", { weekday: "long", month: "long", day: "numeric" }).format(new Date());
 
-  function authenticate(event: FormEvent<HTMLFormElement>) {
+  async function authenticate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     const email = String(form.get("email") || "").trim();
     const password = String(form.get("password") || "");
     const name = String(form.get("name") || "").trim();
+    if (!hasSupabaseConfig || !supabase) { setAuthError("Supabase is not configured. Add the Project URL and Publishable key to .env.local, then restart the app."); return; }
     if (!email.includes("@") || password.length < 6 || (authMode === "signup" && name.length < 2)) { setAuthError("Enter a valid email and a password of at least 6 characters."); return; }
-    update((current) => ({ ...current, loggedIn: true, profile: { ...current.profile, name: authMode === "signup" ? name : current.profile.name || email.split("@")[0], email } }));
     setAuthError("");
+    setAuthMessage("");
+    setAuthPending(true);
+    const result = authMode === "signup"
+      ? await supabase.auth.signUp({ email, password, options: { data: { full_name: name } } })
+      : await supabase.auth.signInWithPassword({ email, password });
+    setAuthPending(false);
+    if (result.error) { setAuthError(result.error.message); return; }
+    if (authMode === "signup" && !result.data.session) setAuthMessage("Check your email to confirm your account, then sign in.");
   }
+  async function signOut() { if (supabase) await supabase.auth.signOut(); setStore(defaultStore); setView("today"); }
   function completeWorkout(id: number) {
     update((current) => ({ ...current, startedWorkout: undefined, workouts: current.workouts.map((w) => w.id === id ? { ...w, completed: true } : w) }));
     setNotice("Workout complete — excellent work.");
   }
 
   if (!ready) return <div className="loading">Loading your movement space…</div>;
-  if (!store.loggedIn) return <AuthScreen mode={authMode} setMode={setAuthMode} error={authError} onSubmit={authenticate} />;
+  if (!user) return <AuthScreen mode={authMode} setMode={setAuthMode} error={authError} message={authMessage} pending={authPending} onSubmit={authenticate} />;
 
   const nav = [{ id: "today", label: "Dashboard", icon: "grid" }, { id: "plan", label: "My plan", icon: "plan" }, { id: "progress", label: "Progress", icon: "chart" }, { id: "profile", label: "Profile", icon: "user" }] as const;
   return <main className="app-shell">
-    <aside className="sidebar"><div className="brand"><b>BM</b><span>BeMotion</span></div><nav>{nav.map((item) => <button key={item.id} className={view === item.id ? "nav active" : "nav"} onClick={() => setView(item.id)}><Icon name={item.icon}/><span>{item.label}</span></button>)}</nav><div className="sidebar-user"><div className="avatar">{initials(store.profile.name)}</div><span>{store.profile.name}</span><button aria-label="Log out" onClick={() => update((current) => ({ ...current, loggedIn: false }))}><Icon name="logout" size={17}/></button></div></aside>
+    <aside className="sidebar"><div className="brand"><BrandMark /></div><nav>{nav.map((item) => <button key={item.id} className={view === item.id ? "nav active" : "nav"} onClick={() => setView(item.id)}><Icon name={item.icon}/><span>{item.label}</span></button>)}</nav><div className="sidebar-user"><div className="avatar">{initials(store.profile.name)}</div><span>{store.profile.name}</span><button aria-label="Log out" onClick={signOut}><Icon name="logout" size={17}/></button></div></aside>
     <section className="workspace">
       {notice && <button className="toast" onClick={() => setNotice("")}>{notice} ×</button>}
       <header className="page-header"><div><p>{greeting}</p><h1>{view === "today" ? `Hi, ${store.profile.name.split(" ")[0]}!` : view === "plan" ? "Your weekly plan" : view === "progress" ? "Your progress" : "Your profile"}</h1></div><div className="header-score"><span>This week</span><strong>{completed}/{store.profile.weeklyWorkouts} sessions</strong></div></header>
@@ -97,8 +122,8 @@ export default function BeMotionApp() {
   </main>;
 }
 
-function AuthScreen({ mode, setMode, error, onSubmit }: { mode: "login" | "signup"; setMode: (m: "login" | "signup") => void; error: string; onSubmit: (e: FormEvent<HTMLFormElement>) => void }) {
-  return <main className="auth"><section className="auth-copy"><div className="brand"><b>BM</b><span>BeMotion</span></div><p className="eyebrow">A simpler way to stay consistent</p><h1>Make movement a habit you can keep.</h1><p>Build a plan around your life, track the small wins, and see your momentum grow.</p><div className="auth-stats"><span><strong>3</strong> focus sessions weekly</span><span><strong>1</strong> clear daily view</span></div></section><section className="auth-panel"><form onSubmit={onSubmit}><p className="eyebrow">{mode === "signup" ? "Start your journey" : "Welcome back"}</p><h2>{mode === "signup" ? "Create your account" : "Sign in to BeMotion"}</h2>{mode === "signup" && <label>Name<input name="name" placeholder="Your name" autoComplete="name" /></label>}<label>Email<input name="email" type="email" placeholder="you@example.com" autoComplete="email" /></label><label>Password<input name="password" type="password" placeholder="At least 6 characters" autoComplete={mode === "signup" ? "new-password" : "current-password"} /></label>{error && <p className="form-error">{error}</p>}<button className="primary wide" type="submit">{mode === "signup" ? "Create my plan" : "Sign in"}</button><p className="switch">{mode === "signup" ? "Already have an account?" : "New to BeMotion?"} <button type="button" onClick={() => setMode(mode === "signup" ? "login" : "signup")}>{mode === "signup" ? "Sign in" : "Create an account"}</button></p></form></section></main>;
+function AuthScreen({ mode, setMode, error, message, pending, onSubmit }: { mode: "login" | "signup"; setMode: (m: "login" | "signup") => void; error: string; message: string; pending: boolean; onSubmit: (e: FormEvent<HTMLFormElement>) => void }) {
+  return <main className="auth"><section className="auth-copy"><div className="brand"><BrandMark /></div><p className="eyebrow">A simpler way to stay consistent</p><h1>Make movement a habit you can keep.</h1><p>Build a plan around your life, track the small wins, and see your momentum grow.</p><div className="auth-stats"><span><strong>3</strong> focus sessions weekly</span><span><strong>1</strong> clear daily view</span></div></section><section className="auth-panel"><form onSubmit={onSubmit}><p className="eyebrow">{mode === "signup" ? "Start your journey" : "Welcome back"}</p><h2>{mode === "signup" ? "Create your account" : "Sign in to BeMotion"}</h2>{mode === "signup" && <label>Name<input name="name" placeholder="Your name" autoComplete="name" required /></label>}<label>Email<input name="email" type="email" placeholder="you@example.com" autoComplete="email" required /></label><label>Password<input name="password" type="password" placeholder="At least 6 characters" minLength={6} autoComplete={mode === "signup" ? "new-password" : "current-password"} required /></label>{error && <p className="form-error" role="alert">{error}</p>}{message && <p className="form-message" role="status">{message}</p>}<button className="primary wide" type="submit" disabled={pending}>{pending ? "Please wait…" : mode === "signup" ? "Create my plan" : "Sign in"}</button><p className="switch">{mode === "signup" ? "Already have an account?" : "New to BeMotion?"} <button type="button" disabled={pending} onClick={() => setMode(mode === "signup" ? "login" : "signup")}>{mode === "signup" ? "Sign in" : "Create an account"}</button></p></form></section></main>;
 }
 
 function Dashboard({ store, score, active, update, completeWorkout, setView }: { store: Store; score: number; active?: Workout; update: (fn: (s: Store) => Store) => void; completeWorkout: (id: number) => void; setView: (v: View) => void }) {
