@@ -104,4 +104,4 @@ Contributions to BeMotion are welcome. Please ensure that all pull requests main
 
 ## 📜 License
 
-This project is licensed under the GPLv3 License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
